@@ -19,9 +19,9 @@ async def startup_event():
     test_db_connection()
 
     # 2) Levantar bots que están marcados como RUNNING en la DB
-    bots = get_running_bots()
-    for bot in bots:
-        ensure_bot_running_from_db_record(bot)
+    # bots = get_running_bots()
+    # for bot in bots:
+    #     ensure_bot_running_from_db_record(bot)
 
 
 # Incluir routers

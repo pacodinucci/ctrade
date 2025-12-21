@@ -3,41 +3,65 @@ from __future__ import annotations
 
 from typing import Literal
 
+import asyncio
 import pandas as pd
 import pandas_ta as ta
+import numpy as np
+
+from app.broker.ctrader_market_data import get_trendbars
 
 TrendType = Literal["bullish", "bearish", "neutral", "no_data"]
 
 # En el bot original usábamos esto como helper para la diaria
-TIMEFRAME_D = "D"
+TIMEFRAME_D = "D1"
 CANDLES_COUNT = 200  # tiene que ser > 50 para EMA50
+
+
+async def get_candles_async(
+    instrument: str,
+    tf: str,
+    count: int = 200,
+) -> pd.DataFrame:
+    """
+    Versión ASYNC: usar dentro de código async (bots, endpoints, etc).
+    """
+    return await get_trendbars(instrument, tf, count)
 
 
 def get_candles(instrument: str, tf: str, count: int = 200) -> pd.DataFrame:
     """
-    DESCARGA DE VELAS (PENDIENTE cTRADER)
+    Versión síncrona para scripts (como test_double_trend.py).
 
-    En el bot viejo esto llamaba a OANDA.
-    Acá vamos a hacer exactamente lo mismo pero contra cTrader.
-
-    Por ahora lo dejamos como NotImplemented para no inventar el endpoint.
-    Cuando tengamos la app 'Active' y tokens listos:
-      - implementamos aquí la llamada al Open API de cTrader
-      - devolvemos un DataFrame con columnas: time, open, high, low, close
+    Si hay un event loop corriendo (por ej. dentro de FastAPI async),
+    NO uses esta función: usá `await get_candles_async(...)`.
     """
-    raise NotImplementedError("get_candles() aún no está implementado para cTrader")
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No hay loop → podemos usar asyncio.run
+        return asyncio.run(get_candles_async(instrument, tf, count))
+    else:
+        # Ya hay loop corriendo → evitar reventar el proceso
+        raise RuntimeError(
+            "get_candles() síncrono llamado dentro de un loop async. "
+            "Usá await get_candles_async() en su lugar."
+        )
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Agrega EMA 50 y velas Heiken Ashi.
-
-    Esto es prácticamente igual al bot anterior.
+    Agrega:
+    - EMA50  → para tendencia diaria
+    - EMA20  → para retrocesos en H1
+    - Heiken Ashi (open/close)
     """
     df = df.copy()
 
-    # EMA 50 sobre el cierre
+    # EMA 50 (D1 trend)
     df["EMA_50"] = ta.ema(df["close"], length=50)
+
+    # EMA 20 (retrocesos H1)
+    df["EMA_20"] = ta.ema(df["close"], length=20)
 
     # Heiken Ashi
     ha = ta.ha(df["open"], df["high"], df["low"], df["close"])
@@ -45,7 +69,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["HA_close"] = ha["HA_close"]
 
     return df
-
 
 def get_trend(df: pd.DataFrame) -> TrendType:
     """
@@ -101,3 +124,31 @@ def get_daily_trend_for_instrument(instrument: str) -> dict:
         "ha_close": float(last["HA_close"]),
         "df_daily": df,
     }
+
+def get_trend_for_instrument_tf(
+    instrument: str,
+    timeframe: str,
+    count: int = CANDLES_COUNT,
+) -> dict:
+    """
+    Versión genérica: igual que get_daily_trend_for_instrument,
+    pero permitiendo elegir el timeframe.
+    """
+    df = get_candles(instrument, timeframe, count)
+    df = add_indicators(df)
+
+    trend = get_trend(df)
+    last = df.iloc[-1]
+
+    return {
+        "instrument": instrument,
+        "timeframe": timeframe,
+        "trend": trend,
+        "last_time": last["time"],
+        "last_close": float(last["close"]),
+        "ema50": float(last["EMA_50"]) if not pd.isna(last["EMA_50"]) else None,
+        "ha_open": float(last["HA_open"]),
+        "ha_close": float(last["HA_close"]),
+        "df": df,
+    }
+

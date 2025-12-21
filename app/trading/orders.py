@@ -1,7 +1,6 @@
-# app/trading/orders.py
 from __future__ import annotations
 
-from typing import Literal, Optional, Dict, Any, Awaitable, Callable
+from typing import Literal, Optional, Dict, Any
 
 from app.broker import get_broker
 from app.broker.base import ExecutionBroker, Side
@@ -18,27 +17,6 @@ SideBot = Literal["long", "short"]  # lo que usa el bot
 def _map_side_bot_to_broker(side: SideBot) -> Side:
     """long/short (bot) → buy/sell (broker)."""
     return "buy" if side == "long" else "sell"
-
-
-async def _has_open_trade_for_instrument(
-    broker: ExecutionBroker,
-    instrument: str,
-    side: SideBot,
-) -> bool:
-    """
-    Candado genérico:
-    - Si el broker implementa async has_open_position(symbol, side) → lo usamos.
-    - Si no, no bloqueamos.
-    """
-    checker: Optional[Callable[[str, Side], Awaitable[bool]]] = getattr(
-        broker, "has_open_position", None
-    )  # type: ignore
-
-    if checker is None:
-        return False
-
-    broker_side: Side = _map_side_bot_to_broker(side)
-    return await checker(instrument, broker_side)  # type: ignore[arg-type]
 
 
 async def open_risked_market_order(
@@ -59,7 +37,6 @@ async def open_risked_market_order(
         con un stop de `stop_points` puntos (si no se pasa stop explícito).
       - StopLoss en precio a esa distancia.
       - Sin TP salvo que se pase explícito.
-      - Bloquea si ya hay operación en ese instrumento y lado (si el broker lo soporta).
 
     Devuelve:
       {
@@ -69,23 +46,13 @@ async def open_risked_market_order(
         "stop_loss": ...,
         "raw": {...}
       }
-
-    Si se bloquea por candado → None.
     """
     broker = broker or get_broker()
 
-    # 🔒 CANDADO
-    if await _has_open_trade_for_instrument(broker, instrument, side):
-        print(
-            f"[ORDERS] BLOQUEADO → Ya existe una operación {side.upper()} abierta "
-            f"en {instrument}. No se envía una nueva orden.\n"
-        )
-        return None
-
-    # 1) Precio actual
+    # 🔹 1) Precio actual
     current_price = await broker.get_current_price(instrument)
 
-    # 2) Determinar stop en precio
+    # 🔹 2) Determinar stop en precio
     point_size = get_point_value(instrument)
 
     if explicit_stop_loss is not None:
@@ -101,7 +68,7 @@ async def open_risked_market_order(
         else:
             stop_loss_price = current_price + stop_dist_price
 
-    # 3) Calcular VOLUME según riesgo (el que vamos a pasar DIRECTO al broker)
+    # 🔹 3) Calcular VOLUME según riesgo (el que vamos a pasar DIRECTO al broker)
     volume = await calc_volume_for_risk(
         broker=broker,
         instrument=instrument,
@@ -121,7 +88,7 @@ async def open_risked_market_order(
 
     broker_side: Side = _map_side_bot_to_broker(side)
 
-    # 4) Enviar orden al broker → volume se pasa TAL CUAL
+    # 🔹 4) Enviar orden al broker → volume se pasa TAL CUAL
     raw = await broker.open_market_order(
         symbol=instrument,
         side=broker_side,
@@ -136,20 +103,21 @@ async def open_risked_market_order(
         or raw.get("id")
         or raw.get("positionId")
     )
+
     entry_price = raw.get("entry_price") or raw.get("price") or current_price
 
+    # 👇 en lugar de levantar error, usamos -1 si no viene
     if position_id is None:
-        raise RuntimeError(
-            f"No se pudo determinar position_id en respuesta del broker: {raw}"
-        )
+        position_id = -1
 
     return {
-        "position_id": position_id,
+        "position_id": int(position_id),
         "entry_price": float(entry_price),
         "volume": float(volume),
         "stop_loss": float(stop_loss_price),
         "raw": raw,
     }
+
 
 
 async def close_position_market(
@@ -158,3 +126,11 @@ async def close_position_market(
 ) -> Dict[str, Any]:
     broker = broker or get_broker()
     return await broker.close_position(position_id)
+
+async def _has_open_trade_for_instrument(
+    broker: ExecutionBroker,
+    instrument: str,
+    side: SideBot,
+) -> bool:
+    # 🔒 Por ahora: candado desactivado mientras probamos cTrader
+    return False

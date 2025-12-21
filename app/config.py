@@ -23,28 +23,27 @@ class Settings(BaseSettings):
     # A dónde te devuelve cTrader luego del login (la que configuraste en el portal)
     CTRADER_REDIRECT_URI: str
 
-    # Cuenta concreta donde vas a operar
+    # Cuenta concreta donde vas a operar (ctidTraderAccountId)
     CTRADER_ACCOUNT_ID: int
+    CTRADER_TRADER_ACCOUNT_ID: int
 
-    # Demo o real (por ahora solo cambia la intención, podemos usarlo en broker/ctrader.py)
+    # Demo o real
     CTRADER_ENV: CTraderEnvironment = "demo"
 
-    # Endpoint base de la API (lo dejamos configurable por si cambia o querés mockear)
+    # Endpoint base de la API (si después querés REST, etc.)
     CTRADER_API_BASE_URL: str = "https://api.spotware.com"  # ajustable
 
-    # Tokens OAuth2 (al principio podés pegarlos a mano;
-    # luego idealmente se persisten en DB y se refrescan con lógica propia)
+    # Tokens OAuth2 (por ahora pegados a mano, luego DB)
     CTRADER_ACCESS_TOKEN: Optional[str] = None
     CTRADER_REFRESH_TOKEN: Optional[str] = None
 
     # -------- DB (opcional, por si usás db.py) --------
     DATABASE_URL: Optional[str] = None
 
-    # Configuración general de pydantic-settings
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore",  # ignora variables extras en .env
+        extra="ignore",
     )
 
 
@@ -52,3 +51,6 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Singleton de Settings para reutilizar en toda la app."""
     return Settings()
+
+
+settings: Settings = get_settings()

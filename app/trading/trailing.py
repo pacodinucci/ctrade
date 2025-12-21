@@ -226,3 +226,160 @@ async def stream_and_trail_position(
         on_close_signal=_on_close_signal,
         poll_seconds=poll_seconds,
     )
+
+Side2 = Literal["long", "short"]
+
+def _get_point_size2(instrument: str) -> float:
+    inst = instrument.upper()
+    if inst.endswith("JPY"):
+        return 0.001
+    if inst.startswith("XAU"):
+        return 0.01
+    return 0.00001
+
+
+async def stream_trailing_be_internal(
+    instrument: str,
+    side: Side2,
+    entry_price: float,
+    units: float,
+    get_price: GetPrice,
+    on_update: Optional[OnUpdate] = None,
+    on_close_signal: Optional[OnCloseSignal] = None,
+    poll_seconds: float = 0.2,
+    # --- parámetros de tu regla ---
+    arm_at_points: float = 50,          # se arma trailing al ganar 50 pts
+    trail_distance_points: float = 50,  # distancia del best_price
+    be_buffer_points: float = 5,        # BE + buffer por slippage
+):
+    """
+    Trailing interno que:
+    - NO toca el SL del broker.
+    - Se arma recién al ganar `arm_at_points`.
+    - Arranca en BE+buffer.
+    - Luego sigue al best_price a `trail_distance_points`.
+    - Al tocar close_level => emite close_signal.
+    """
+    ps = _get_point_size2(instrument)
+
+    best_price = entry_price
+    close_level: Optional[float] = None
+    armed = False
+
+    if on_update:
+        on_update(
+            {
+                "event": "init",
+                "instrument": instrument,
+                "side": side,
+                "entry_price": entry_price,
+                "best_price": best_price,
+                "close_level": close_level,
+                "units": units,
+                "price": entry_price,
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    while True:
+        tick = await get_price()
+        price = float(tick["price"])
+        time_ = tick.get("time") or datetime.now(timezone.utc).isoformat()
+
+        moved = False
+
+        if side == "long":
+            if price > best_price:
+                best_price = price
+
+            profit_points = (best_price - entry_price) / ps
+
+            # 1) Armar al llegar a +arm_at_points
+            if (not armed) and profit_points >= arm_at_points:
+                armed = True
+                close_level = entry_price + (be_buffer_points * ps)
+                moved = True
+
+            # 2) Una vez armado, trail por best_price - dist
+            if armed and close_level is not None:
+                candidate = best_price - (trail_distance_points * ps)
+                if candidate > close_level:
+                    close_level = candidate
+                    moved = True
+
+            # 3) Cierre si toca close_level
+            if armed and close_level is not None and price <= close_level:
+                if on_close_signal:
+                    pnl = price - entry_price
+                    puntos = pnl / ps
+                    await on_close_signal(
+                        {
+                            "event": "close_signal",
+                            "instrument": instrument,
+                            "side": side,
+                            "price": price,
+                            "time": time_,
+                            "entry_price": entry_price,
+                            "best_price": best_price,
+                            "close_level": close_level,
+                            "pnl": pnl,
+                            "puntos": puntos,
+                            "units": units,
+                        }
+                    )
+                break
+
+        else:  # short
+            if price < best_price:
+                best_price = price
+
+            profit_points = (entry_price - best_price) / ps
+
+            if (not armed) and profit_points >= arm_at_points:
+                armed = True
+                close_level = entry_price - (be_buffer_points * ps)
+                moved = True
+
+            if armed and close_level is not None:
+                candidate = best_price + (trail_distance_points * ps)
+                if candidate < close_level:
+                    close_level = candidate
+                    moved = True
+
+            if armed and close_level is not None and price >= close_level:
+                if on_close_signal:
+                    pnl = entry_price - price
+                    puntos = pnl / ps
+                    await on_close_signal(
+                        {
+                            "event": "close_signal",
+                            "instrument": instrument,
+                            "side": side,
+                            "price": price,
+                            "time": time_,
+                            "entry_price": entry_price,
+                            "best_price": best_price,
+                            "close_level": close_level,
+                            "pnl": pnl,
+                            "puntos": puntos,
+                            "units": units,
+                        }
+                    )
+                break
+
+        if moved and on_update:
+            on_update(
+                {
+                    "event": "trail_update",
+                    "instrument": instrument,
+                    "side": side,
+                    "price": price,
+                    "time": time_,
+                    "best_price": best_price,
+                    "close_level": close_level,
+                    "units": units,
+                    "armed": armed,
+                }
+            )
+
+        await asyncio.sleep(poll_seconds)

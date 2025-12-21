@@ -6,6 +6,8 @@ import threading
 import time
 from typing import Dict, Optional, Set, List, Any
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import pandas as pd
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
 from ctrader_open_api.messages import OpenApiMessages_pb2 as OAMsg
@@ -25,6 +27,17 @@ class Quote:
     ask: float
     mid: float
     timestamp: float
+
+TF_TO_PERIOD = {
+    "M1": 1,   # ProtoOATrendbarPeriod.M1
+    "M5": 5,   # ProtoOATrendbarPeriod.M5
+    "M15": 7,  # ProtoOATrendbarPeriod.M15
+    "M30": 8,  # ProtoOATrendbarPeriod.M30
+    "H1": 9,   # ProtoOATrendbarPeriod.H1
+    "H4": 10,  # ProtoOATrendbarPeriod.H4
+    "D1": 12,  # ProtoOATrendbarPeriod.D1
+}
+
 
 class CTraderMarketDataService:
     """
@@ -46,11 +59,17 @@ class CTraderMarketDataService:
         # symbolId -> symbolName
         self._id_to_symbol: Dict[int, str] = {}
 
+        # digits (cantidad de decimales)
+        self._symbol_digits: Dict[str, int] = {}
+
         # symbolName -> último quote
         self._latest_quotes: Dict[str, Quote] = {}
 
         # símbolos a los que ya nos suscribimos
         self._subscribed: Set[str] = set()
+
+        # lista de queues que escuchan ese símbolo
+        self._listeners: Dict[str, List[asyncio.Queue[Quote]]] = {}
 
         # Evento para saber cuándo ya tenemos la lista de símbolos
         self._symbols_ready = asyncio.Event()
@@ -170,32 +189,37 @@ class CTraderMarketDataService:
             self._symbol_ids[name_u] = int(sid)
             self._id_to_symbol[int(sid)] = name_u
 
+            # 👉 digits por símbolo (para escalar precios SL/TP)
+            digits = getattr(s, "digits", None)
+            if digits is None:
+                digits = getattr(s, "pipPosition", 5)
+            try:
+                self._symbol_digits[name_u] = int(digits)
+            except Exception:
+                self._symbol_digits[name_u] = 5  # fallback
+
         loop = self._get_asyncio_loop()
         if loop is not None:
             loop.call_soon_threadsafe(self._symbols_ready.set)
 
-    # def _on_spot_event(self, decoded: OAMsg.ProtoOASpotEvent) -> None:
-    #     symbol_id = decoded.symbolId
-    #     bid = decoded.bid
-    #     ask = decoded.ask
-    #     mid = (bid + ask) / 2
-
-    #     symbol_name = self._id_to_symbol.get(symbol_id)
-    #     if symbol_name is None:
-    #         return
-
-    #     self._latest_mid[symbol_name] = mid
 
     def _on_spot_event(self, decoded: OAMsg.ProtoOASpotEvent) -> None:
         symbol_id = decoded.symbolId
-        bid = decoded.bid
-        ask = decoded.ask
-        mid = (bid + ask) / 2.0
+        raw_bid = decoded.bid
+        raw_ask = decoded.ask
         ts = time.time()
 
         symbol_name = self._id_to_symbol.get(symbol_id)
         if symbol_name is None:
             return
+
+        # cuántos decimales tiene este símbolo (EURUSD → 5, muchos JPY → 3, etc.)
+        digits = self._symbol_digits.get(symbol_name, 5)
+        scale = 10 ** digits
+
+        bid = raw_bid / scale
+        ask = raw_ask / scale
+        mid = (bid + ask) / 2.0
 
         quote = Quote(
             symbol=symbol_name,
@@ -205,7 +229,27 @@ class CTraderMarketDataService:
             timestamp=ts,
         )
 
+        # 1️⃣ actualizar cache
         self._latest_quotes[symbol_name] = quote
+
+        # 2️⃣ notificar listeners
+        listeners = self._listeners.get(symbol_name, [])
+        if not listeners:
+            return
+
+        loop = self._get_asyncio_loop()
+        if loop is None:
+            for q in listeners:
+                try:
+                    q.put_nowait(quote)
+                except Exception as e:
+                    print(f"[MD] Error push quote a listener (no loop): {e!r}")
+            return
+
+        for q in listeners:
+            loop.call_soon_threadsafe(q.put_nowait, quote)
+
+
 
     def _on_execution_event(self, decoded: OAMsg.ProtoOAExecutionEvent) -> None:
         """
@@ -244,17 +288,46 @@ class CTraderMarketDataService:
             return asyncio.get_running_loop()
         except RuntimeError:
             return None
+        
+    async def _ensure_client_ready(self, timeout: float = 5.0) -> None:
+        """
+        Espera a que el cliente OpenAPI esté inicializado por el thread de Twisted.
+        """
+        if self._client is not None:
+            return
+
+        elapsed = 0.0
+        interval = 0.05
+
+        while elapsed < timeout:
+            if self._client is not None:
+                return
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+        raise RuntimeError("Timeout esperando inicialización del cliente OpenAPI")
+
 
     async def _ensure_symbols_loaded(self, timeout: float = 5.0) -> None:
+        # Primero nos aseguramos de que el cliente exista
+        await self._ensure_client_ready(timeout=timeout)
+
         if self._symbol_ids:
             return
 
-        try:
-            await asyncio.wait_for(self._symbols_ready.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                "Timeout esperando lista de símbolos desde cTrader Open API"
-            )
+        elapsed = 0.0
+        interval = 0.05
+
+        while elapsed < timeout:
+            if self._symbol_ids:
+                return
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+        raise RuntimeError(
+            "Timeout esperando lista de símbolos desde cTrader Open API (polling)"
+        )
+
 
     async def _subscribe_symbol_if_needed(self, symbol: str) -> None:
         symbol_u = symbol.upper()
@@ -283,27 +356,38 @@ class CTraderMarketDataService:
         self._subscribed.add(symbol_u)
         print(f"📡 [MD] Suscripto a spots de {symbol_u} (symbolId={symbol_id})")
 
-    # async def get_price(self, symbol: str, timeout: float = 5.0) -> float:
-    #     """
-    #     Devuelve el último mid de mercado (bid+ask)/2 para el símbolo dado.
-    #     """
-    #     symbol_u = symbol.upper()
+    def get_last_quote(self, symbol: str) -> Optional[Quote]:
+        symbol_u = symbol.upper()
+        return self._latest_quotes.get(symbol_u)
 
-    #     await self._subscribe_symbol_if_needed(symbol_u)
+    def get_last_bid(self, symbol: str) -> Optional[float]:
+        q = self.get_last_quote(symbol)
+        return q.bid if q else None
 
-    #     elapsed = 0.0
-    #     interval = 0.05
+    def get_last_ask(self, symbol: str) -> Optional[float]:
+        q = self.get_last_quote(symbol)
+        return q.ask if q else None
 
-    #     while elapsed < timeout:
-    #         if symbol_u in self._latest_mid:
-    #             return float(self._latest_mid[symbol_u])
+    def get_last_mid(self, symbol: str) -> Optional[float]:
+        q = self.get_last_quote(symbol)
+        return q.mid if q else None
+    
+    def get_last_quote(self, symbol: str) -> Optional[Quote]:
+        symbol_u = symbol.upper()
+        return self._latest_quotes.get(symbol_u)
 
-    #         await asyncio.sleep(interval)
-    #         elapsed += interval
+    def get_last_bid(self, symbol: str) -> Optional[float]:
+        q = self.get_last_quote(symbol)
+        return q.bid if q else None
 
-    #     raise RuntimeError(
-    #         f"Timeout esperando spot de {symbol_u} desde cTrader Open API"
-    #     )
+    def get_last_ask(self, symbol: str) -> Optional[float]:
+        q = self.get_last_quote(symbol)
+        return q.ask if q else None
+
+    def get_last_mid(self, symbol: str) -> Optional[float]:
+        q = self.get_last_quote(symbol)
+        return q.mid if q else None
+
 
     async def get_price(self, symbol: str, timeout: float = 5.0) -> float:
         symbol_u = symbol.upper()
@@ -403,6 +487,124 @@ class CTraderMarketDataService:
             return result  # lista de diccionarios
         except asyncio.TimeoutError:
             raise RuntimeError("Timeout esperando ProtoOAReconcileRes con posiciones abiertas")
+        
+    async def get_trendbars(
+        self,
+        symbol: str,
+        timeframe: str,
+        count: int = 200,
+        timeout: float = 15.0,
+    ) -> pd.DataFrame:
+        """
+        Devuelve un DataFrame con columnas:
+        time, open, high, low, close
+
+        Usa ProtoOAGetTrendbarsReq sobre el mismo cliente OpenAPI.
+        """
+        # if self._client is None:
+        #     raise RuntimeError("Cliente OpenAPI aún no inicializado")
+
+        symbol_u = symbol.upper()
+
+        await self._ensure_symbols_loaded()
+
+        if symbol_u not in self._symbol_ids:
+            raise RuntimeError(f"Símbolo {symbol_u} no encontrado en lista de símbolos")
+
+        if timeframe not in TF_TO_PERIOD:
+            raise RuntimeError(f"Timeframe no soportado: {timeframe}")
+
+        symbol_id = self._symbol_ids[symbol_u]
+        period = TF_TO_PERIOD[timeframe]
+
+        # Rango de tiempo suficientemente largo y después cortamos a `count`
+        now = datetime.now(timezone.utc)
+        # 40 días es overkill pero seguro alcanza para H4/H1
+        from_ts = int((now - timedelta(days=40)).timestamp() * 1000)
+        to_ts = int(now.timestamp() * 1000)
+
+        req = OAMsg.ProtoOAGetTrendbarsReq()
+        req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
+        req.symbolId = symbol_id
+        req.period = period
+        req.fromTimestamp = from_ts
+        req.toTimestamp = to_ts
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        def _on_trendbars(message):
+            try:
+                decoded = Protobuf.extract(message)  # ProtoOAGetTrendbarsRes
+                bars = getattr(decoded, "trendbar", [])
+
+                data = []
+                for b in bars:
+                    # ⏱ tiempo: tu proto usa utcTimestampInMinutes
+                    if hasattr(b, "utcTimestampInMinutes"):
+                        ts_sec = b.utcTimestampInMinutes * 60
+                        ts = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                    elif hasattr(b, "utcTimestamp"):
+                        ts = datetime.fromtimestamp(b.utcTimestamp / 1000, tz=timezone.utc)
+                    else:
+                        ts = datetime.now(timezone.utc)
+
+                    # 💰 precios codificados como:
+                    # low en crudo, y deltas desde low para open/high/close
+                    low_raw = b.low
+                    open_raw = low_raw + b.deltaOpen
+                    close_raw = low_raw + b.deltaClose
+                    high_raw = low_raw + b.deltaHigh
+
+                    # Los enteros vienen x10^5 (típico en FX cTrader)
+                    scale = 10**5
+
+                    data.append(
+                        {
+                            "time": ts,
+                            "open": open_raw / scale,
+                            "high": high_raw / scale,
+                            "low": low_raw / scale,
+                            "close": close_raw / scale,
+                        }
+                    )
+
+                df = pd.DataFrame(data).sort_values("time").reset_index(drop=True)
+                if len(df) > count:
+                    df = df.iloc[-count:].reset_index(drop=True)
+
+                if not fut.done():
+                    loop.call_soon_threadsafe(fut.set_result, df)
+                
+            except Exception as e:
+                if not fut.done():
+                    loop.call_soon_threadsafe(fut.set_exception, e)
+
+
+                df = pd.DataFrame(data).sort_values("time").reset_index(drop=True)
+                if len(df) > count:
+                    df = df.iloc[-count:].reset_index(drop=True)
+
+                loop.call_soon_threadsafe(fut.set_result, df)
+            except Exception as e:
+                loop.call_soon_threadsafe(fut.set_exception, e)
+
+        def _on_error_deferred(failure):
+            loop.call_soon_threadsafe(
+                fut.set_exception,
+                RuntimeError(f"Error en ProtoOAGetTrendbarsReq: {failure!r}"),
+            )
+
+        d = self._client.send(req)
+        d.addCallback(_on_trendbars)
+        d.addErrback(_on_error_deferred)
+
+        try:
+            df = await asyncio.wait_for(fut, timeout=timeout)
+            return df
+        except asyncio.TimeoutError:
+            raise RuntimeError("Timeout esperando trendbars desde cTrader Open API")
+
         
     async def has_open_position(
         self,
@@ -641,6 +843,96 @@ class CTraderMarketDataService:
             "positionId": position_id,
             "volume": volume,
         }
+    
+    async def set_position_sl_tp(
+        self,
+        symbol: str,
+        position_id: int,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Modifica SL/TP de una posición vía ProtoOAAmendPositionSLTPReq.
+
+        - symbol: solo para logging (los precios son absolutos, en float).
+        - position_id: id real de cTrader.
+        - stop_loss / take_profit: precios absolutos (ej. 4257.93).
+        """
+        if self._client is None:
+            raise RuntimeError("Cliente OpenAPI aún no inicializado")
+
+        # Nos aseguramos de que ya tenemos sesión y símbolos cargados
+        await self._ensure_symbols_loaded()
+
+        symbol_u = symbol.upper()
+
+        # ⚠️ OJO: en esta request los precios van como float absolutos,
+        # NO hay que escalarlos por digits.
+        req = OAMsg.ProtoOAAmendPositionSLTPReq()
+        req.ctidTraderAccountId = CTID_TRADER_ACCOUNT_ID
+        req.positionId = int(position_id)
+
+        if stop_loss is not None:
+            req.stopLoss = float(stop_loss)
+
+        if take_profit is not None:
+            req.takeProfit = float(take_profit)
+
+        print(
+            f"[MD] Enviando AMEND SL/TP → positionId={position_id}, "
+            f"symbol={symbol_u}, SL={stop_loss}, TP={take_profit}"
+        )
+
+        d = self._client.send(req)
+        d.addErrback(self._on_error)
+
+        # De momento no esperamos ExecutionEvent específico
+        return {
+            "sent": True,
+            "positionId": position_id,
+            "symbol": symbol_u,
+            "stopLoss": stop_loss,
+            "takeProfit": take_profit,
+        }
+
+    async def subscribe(self, symbol: str) -> asyncio.Queue[Quote]:
+        """
+        Crea una cola de quotes para ese símbolo y la registra como listener.
+        """
+        symbol_u = symbol.upper()
+
+        # Aseguramos que el símbolo existe y estamos suscriptos en OpenAPI
+        await self._subscribe_symbol_if_needed(symbol_u)
+
+        q: asyncio.Queue[Quote] = asyncio.Queue()
+        if symbol_u not in self._listeners:
+            self._listeners[symbol_u] = []
+
+        self._listeners[symbol_u].append(q)
+        print(f"[MD] Listener agregado para {symbol_u}. Total: {len(self._listeners[symbol_u])}")
+        return q
+
+    async def unsubscribe(self, symbol: str, queue: asyncio.Queue[Quote]) -> None:
+        """
+        Elimina una cola de quotes de la lista de listeners del símbolo.
+        """
+        symbol_u = symbol.upper()
+        queues = self._listeners.get(symbol_u)
+        if not queues:
+            return
+
+        try:
+            queues.remove(queue)
+            print(f"[MD] Listener removido para {symbol_u}. Restan: {len(queues)}")
+        except ValueError:
+            # La queue ya no estaba en la lista
+            pass
+
+        if not queues:
+            # Podrías opcionalmente desuscribirte de OpenAPI aquí.
+            # Por ahora solo limpiamos el dict.
+            self._listeners.pop(symbol_u, None)
+
 
 
 
@@ -686,18 +978,29 @@ async def close_position(
     """
     return await _market_data_service.close_position(position_id, volume)
 
-def get_last_quote(self, symbol: str) -> Optional[Quote]:
-    symbol_u = symbol.upper()
-    return self._latest_quotes.get(symbol_u)
+async def subscribe_quotes(symbol: str) -> asyncio.Queue[Quote]:
+    return await _market_data_service.subscribe(symbol)
 
-def get_last_bid(self, symbol: str) -> Optional[float]:
-    q = self.get_last_quote(symbol)
-    return q.bid if q else None
+async def unsubscribe_quotes(symbol: str, queue: asyncio.Queue[Quote]) -> None:
+    await _market_data_service.unsubscribe(symbol, queue)
 
-def get_last_ask(self, symbol: str) -> Optional[float]:
-    q = self.get_last_quote(symbol)
-    return q.ask if q else None
+async def get_trendbars(symbol: str, timeframe: str, count: int = 200) -> pd.DataFrame:
+    return await _market_data_service.get_trendbars(symbol, timeframe, count)
 
-def get_last_mid(self, symbol: str) -> Optional[float]:
-    q = self.get_last_quote(symbol)
-    return q.mid if q else None
+async def set_position_sl_tp(
+    symbol: str,
+    position_id: int,
+    stop_loss: Optional[float] = None,
+    take_profit: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Helper global para modificar SL/TP de una posición usando el singleton.
+    """
+    return await _market_data_service.set_position_sl_tp(
+        symbol=symbol,
+        position_id=position_id,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+    )
+
+

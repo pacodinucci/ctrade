@@ -172,3 +172,19 @@ class CTraderBroker(ExecutionBroker):
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+# Singleton para broker REST
+_broker = CTraderBroker()
+
+
+async def get_account_balance() -> float:
+    """
+    Helper global para obtener el balance actual de la cuenta cTrader.
+    """
+    return await _broker.get_account_balance()
+
+async def get_account_info():
+    return await _broker.get_account_info()
+
+async def get_price(symbol: str):
+    return await _broker.get_current_price(symbol)

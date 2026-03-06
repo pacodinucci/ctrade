@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Tuple
+from typing import List, Literal, Tuple, Optional
 import statistics
 
 TrendBias = Literal["bullish", "bearish", "neutral", "insufficient_data"]
@@ -40,7 +40,7 @@ def _theil_sen_slope(levels: List[float]) -> float:
     n = len(levels)
     if n < 2:
         return 0.0
-    slopes = []
+    slopes: List[float] = []
     for i in range(n - 1):
         for j in range(i + 1, n):
             slopes.append((levels[j] - levels[i]) / (j - i))
@@ -97,9 +97,7 @@ def determine_trend_bias_from_swings_flexible(
     # - slope_score: pendiente medida en "eps por step"
     slope_score = ((hslope / eps) + (lslope / eps)) / 2.0  # promedio highs/lows
 
-    # - violation_score: en bullish, las bajadas son violaciones; en bearish, las subidas son violaciones.
-    #   Como todavía no sabemos bias, lo incluimos como "asimetría": ups - downs (normalizado)
-    #   Positivo favorece bullish, negativo favorece bearish.
+    # - move_score: asimetría de movimientos (ups - downs), normalizado
     move_balance_highs = (hu - hd) / comparisons
     move_balance_lows = (lu - ld) / comparisons
     move_score = (move_balance_highs + move_balance_lows) / 2.0
@@ -141,3 +139,100 @@ def determine_trend_bias_from_swings_flexible(
         lows_down=ld,
         reason=reason,
     )
+
+
+def determine_trend_bias_with_daily_invalidation(
+    highs: List,  # objetos con .level
+    lows: List,   # objetos con .level
+    eps: float,
+    day_high: Optional[float],
+    day_low: Optional[float],
+    eps_break: float,
+    min_points: int = 4,
+    slope_weight: float = 1.0,
+    violation_weight: float = 0.35,
+    threshold: float = 0.8,
+    use_extremes: bool = False,
+) -> TrendBiasResult:
+    """
+    Calcula bias por swings (función original) y luego aplica invalidación:
+
+      - Si bias base es bearish y el precio del día alcanza el "último high":
+          => invalidación => bullish
+      - Si bias base es bullish y el precio del día alcanza el "último low":
+          => invalidación => bearish
+
+    Parámetros clave:
+      day_high/day_low: High/Low del día actual (D1 en formación) o del día que uses.
+      eps_break: tolerancia en PRECIO para considerar "alcanzó" el nivel (ej: 10-30 points * point_size).
+      use_extremes:
+        - False (recomendado): "último high/low" = highs[-1].level / lows[-1].level
+        - True: "último high/low" = max(highs)/min(lows) dentro de la lista recibida
+    """
+
+    base = determine_trend_bias_from_swings_flexible(
+        highs=highs,
+        lows=lows,
+        eps=eps,
+        min_points=min_points,
+        slope_weight=slope_weight,
+        violation_weight=violation_weight,
+        threshold=threshold,
+    )
+
+    if base.bias in ("insufficient_data", "neutral"):
+        return base
+
+    if not highs or not lows:
+        return base
+
+    if use_extremes:
+        last_high = max(h.level for h in highs)
+        last_low = min(l.level for l in lows)
+        ref_kind = "extremes"
+    else:
+        last_high = highs[-1].level
+        last_low = lows[-1].level
+        ref_kind = "last"
+
+    # Bearish invalidado si el día alcanza el high de referencia
+    if base.bias == "bearish" and day_high is not None:
+        if day_high >= (last_high - eps_break):
+            return TrendBiasResult(
+                bias="bullish",
+                score=base.score,
+                highs_slope=base.highs_slope,
+                lows_slope=base.lows_slope,
+                highs_up=base.highs_up,
+                highs_down=base.highs_down,
+                lows_up=base.lows_up,
+                lows_down=base.lows_down,
+                reason=(
+                    base.reason
+                    + f" | OVERRIDE(daily_invalidation/{ref_kind}): bearish->bullish "
+                      f"because day_high={day_high:.6g} >= last_high-eps_break={(last_high-eps_break):.6g} "
+                      f"(last_high={last_high:.6g}, eps_break={eps_break:.6g})"
+                ),
+            )
+
+    # Bullish invalidado si el día alcanza el low de referencia
+    if base.bias == "bullish" and day_low is not None:
+        if day_low <= (last_low + eps_break):
+            return TrendBiasResult(
+                bias="bearish",
+                score=base.score,
+                highs_slope=base.highs_slope,
+                lows_slope=base.lows_slope,
+                highs_up=base.highs_up,
+                highs_down=base.highs_down,
+                lows_up=base.lows_up,
+                lows_down=base.lows_down,
+                reason=(
+                    base.reason
+                    + f" | OVERRIDE(daily_invalidation/{ref_kind}): bullish->bearish "
+                      f"because day_low={day_low:.6g} <= last_low+eps_break={(last_low+eps_break):.6g} "
+                      f"(last_low={last_low:.6g}, eps_break={eps_break:.6g})"
+                ),
+            )
+
+    return base
